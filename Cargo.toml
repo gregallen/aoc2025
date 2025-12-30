@@ -1,0 +1,11 @@
+[package]
+name = "aoc2025"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bit-vec = "0.8"
+rand = "0.9"
+derive_more = { version = "2.1", features = ["full"] }
+derivative = "2.2"
+anyhow = "1.0"
