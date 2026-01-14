@@ -1,6 +1,6 @@
-use crate::Direction::Northward;
-use crate::Outline::{East, North, South, West};
-use Direction::{Eastward, Southward, Westward};
+use crate::Direction::North;
+use crate::Outline::{Horizontal, Vertical};
+use Direction::{East, South, West};
 use anyhow::Error;
 use derivative::Derivative;
 use simple_svg::Group;
@@ -23,30 +23,47 @@ enum Turn {
     Right,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Eq)]
 enum Direction {
-    Northward,
-    Southward,
-    Eastward,
-    Westward,
+    North,
+    South,
+    East,
+    West,
 }
 
 impl Direction {
-    fn turn(&self, previously: &Direction) -> Turn {
+    fn which_turn(&self, previously: &Direction) -> Turn {
         match (previously, self) {
-            (Northward, Eastward) => Turn::Right,
-            (Eastward, Southward) => Turn::Right,
-            (Southward, Westward) => Turn::Right,
-            (Westward, Northward) => Turn::Right,
+            (North, East) => Turn::Right,
+            (East, South) => Turn::Right,
+            (South, West) => Turn::Right,
+            (West, North) => Turn::Right,
 
-            (Northward, Westward) => Turn::Left,
-            (Westward, Southward) => Turn::Left,
-            (Southward, Eastward) => Turn::Left,
-            (Eastward, Northward) => Turn::Left,
+            (North, West) => Turn::Left,
+            (West, South) => Turn::Left,
+            (South, East) => Turn::Left,
+            (East, North) => Turn::Left,
 
             (_, _) => {
                 panic!("Can't turn from {previously:?} to {self:?}")
             }
+        }
+    }
+
+    fn turn(&self, turn: Turn) -> Direction {
+        match turn {
+            Turn::Left => match self {
+                North => West,
+                East => North,
+                South => East,
+                West => South,
+            },
+            Turn::Right => match self {
+                North => East,
+                East => South,
+                South => West,
+                West => North,
+            },
         }
     }
 }
@@ -54,22 +71,18 @@ impl Direction {
 /// SVG style: `y` increases downwards, `x` increases rightwards. South is y increasing, East is x increasing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Outline {
+    Horizontal(Direction, RangeInclusive<usize>, Turn),
     /// increasing x
-    East(RangeInclusive<usize>, Turn),
-    /// decreasing x
-    West(RangeInclusive<usize>, Turn),
     /// decreasing y
-    North(usize, Turn),
-    /// increasing y
-    South(usize, Turn),
+    Vertical(Direction, usize, Turn),
 }
 
 impl Outline {
     #[inline]
     fn index(&self) -> usize {
         match self {
-            East(h, _) | West(h, _) => *h.start(),
-            North(v, _) | South(v, _) => *v,
+            Horizontal(_, h, _) => *h.start(),
+            Vertical(_, v, _) => *v,
         }
     }
 }
@@ -181,9 +194,9 @@ fn is_covered(p: &Point, q: &Point, bitmap: &Vec<Vec<RangeInclusive<usize>>>) ->
     // or the point lies on a vertical or wholly inside a horizontal.
     // If we find any strip of the rectangle starts after an even number of boundaries
     // we can immediately return false
-    // let left_edge = North(min_x);
-    // let right_edge = North(max_x);
-    // let past_right_edge = North(max_x + 1);
+    // let left_edge = Vertical(Northward, min_x);
+    // let right_edge = Vertical(Northward, max_x);
+    // let past_right_edge = Vertical(Northward, max_x + 1);
     let counter_example = bitmap[min_y..=max_y].iter().find(|row| {
         // let to_the_left = row.range(..=&left_edge);
         // let verticals_to_left: usize = to_the_left.clone().map(Outline::verticals).sum();
@@ -248,9 +261,9 @@ fn is_covered(p: &Point, q: &Point, bitmap: &Vec<Vec<RangeInclusive<usize>>>) ->
 fn direction(from: &Point, to: &Point) -> Direction {
     if from.x == to.x {
         // north or south
-        if from.y < to.y { Southward } else { Northward }
+        if from.y < to.y { South } else { North }
     } else {
-        if from.x < to.x { Eastward } else { Westward }
+        if from.x < to.x { East } else { West }
     }
 }
 
@@ -263,24 +276,24 @@ fn draw(points: &[Point], bitmap: &mut Vec<BTreeSet<Outline>>) {
         let prev = &points[(i + num_points - 1) % num_points];
 
         let direction = direction(prev, &point);
-        let turn = direction.turn(&previous_direction);
+        let turn = direction.which_turn(&previous_direction);
 
         let outline = match direction {
-            Northward => North(*x, turn),
-            Southward => South(*x, turn),
-            Eastward => East(prev.x..=*x, turn),
-            Westward => West(*x..=prev.x, turn),
+            North => Vertical(North, *x, turn),
+            South => Vertical(South, *x, turn),
+            East => Horizontal(East, prev.x..=*x, turn),
+            West => Horizontal(West, *x..=prev.x, turn),
         };
 
         match direction {
-            Northward | Southward => {
+            North | South => {
                 let from_y = prev.y.min(*y) + 1;
                 let to_y = prev.y.max(*y);
                 for bits in &mut bitmap[from_y..to_y] {
                     bits.insert(outline.clone());
                 }
             }
-            Eastward | Westward => {
+            East | West => {
                 bitmap[*y].insert(outline);
             }
         }
@@ -298,23 +311,23 @@ fn fill_row(row: &BTreeSet<Outline>) -> Vec<RangeInclusive<usize>> {
     let mut outline_iter = row.iter().peekable();
     while let Some(o) = outline_iter.next() {
         match o {
-            North(left, _) => {
+            Vertical(North, left, _) => {
                 let mut rightmost = None;
                 // this is typical at left edge
                 // fill through any WR, terminating at a WL or N?, or just this outline if next is none or S?
                 while let Some(next) = outline_iter.peek() {
                     match next {
-                        West(rang, Turn::Right) => {
+                        Horizontal(West, rang, Turn::Right) => {
                             outline_iter.next();
                             rightmost = Some(rang.end());
                         }
-                        West(rang, Turn::Left) => {
+                        Horizontal(West, rang, Turn::Left) => {
                             // in this case we stop filling
                             outline_iter.next();
                             rightmost = Some(rang.end());
                             break;
                         }
-                        North(right, _) => {
+                        Vertical(North, right, _) => {
                             rightmost = Some(right);
                         }
                         _ => {
@@ -324,30 +337,30 @@ fn fill_row(row: &BTreeSet<Outline>) -> Vec<RangeInclusive<usize>> {
                 }
                 new_row.push(*left..=*rightmost.expect("No right edge!"));
             }
-            West(rang, Turn::Left) => {
+            Horizontal(West, rang, Turn::Left) => {
                 // typically around 12 o'clock position
                 // ??? Sounds wrong. surely always going East/right here?
                 panic!("Unexpected {o:?} at start of row {row:?}")
                 // new_row.push(rang.clone());
             }
-            East(rang, Turn::Right) | West(rang, Turn::Right) => {
+            Horizontal(direction, rang, Turn::Right) => {
                 // likely a "peak" around 6 o'clock position, or low hanging peak around 12 o'clock position
                 // but if we see a South after east, or North after West it was actually a trough
                 // TODO implement this!
                 let mut rightmost = rang.end();
                 while let Some(next) = outline_iter.peek() {
                     match next {
-                        West(rang, Turn::Right) => {
+                        Horizontal(West, rang, Turn::Right) => {
                             outline_iter.next();
                             rightmost = rang.end();
                         }
-                        West(rang, Turn::Left) => {
+                        Horizontal(West, rang, Turn::Left) => {
                             // in this case we stop filling
                             outline_iter.next();
                             rightmost = rang.end();
                             break;
                         }
-                        North(right, _) => {
+                        Vertical(North, right, _) => {
                             rightmost = right;
                         }
                         _ => {
@@ -357,11 +370,11 @@ fn fill_row(row: &BTreeSet<Outline>) -> Vec<RangeInclusive<usize>> {
                 }
                 new_row.push(*rang.start()..=*rightmost);
             }
-            East(rang, Turn::Left) => {
+            Horizontal(direction, rang, Turn::Left) => {
                 // typically around 6 o'clock position
                 new_row.push(rang.clone());
             }
-            South(_, _) => {
+            Vertical(_, _, _) => {
                 panic!("Unexpected {o:?} at start of row {row:?}")
             }
         }
@@ -461,9 +474,9 @@ mod tests {
 
         assert_eq!(
             vec![
-                BTreeSet::from([East(0..=2, Right)]),
-                BTreeSet::from([North(0, Right), South(2, Right)]),
-                BTreeSet::from([West(0..=2, Right)]),
+                BTreeSet::from([Horizontal(East, 0..=2, Right)]),
+                BTreeSet::from([Vertical(North, 0, Right), Vertical(South, 2, Right)]),
+                BTreeSet::from([Horizontal(West, 0..=2, Right)]),
             ],
             bitmap
         );
@@ -484,9 +497,9 @@ mod tests {
 
         assert_eq!(
             vec![
-                BTreeSet::from([West(0..=2, Left)]),
-                BTreeSet::from([South(0, Left), North(2, Left)]),
-                BTreeSet::from([East(0..=2, Left)]),
+                BTreeSet::from([Horizontal(West, 0..=2, Left)]),
+                BTreeSet::from([Vertical(South, 0, Left), Vertical(North, 2, Left)]),
+                BTreeSet::from([Horizontal(East, 0..=2, Left)]),
             ],
             bitmap
         );
@@ -497,9 +510,9 @@ mod tests {
         assert_eq!(
             vec![1..=6],
             fill_row(&BTreeSet::from([
-                East(1..=2, Right),
-                South(4, Right),
-                North(6, Left)
+                Horizontal(East, 1..=2, Right),
+                Vertical(South, 4, Right),
+                Vertical(North, 6, Left)
             ]))
         );
     }
@@ -688,9 +701,9 @@ mod tests {
         assert_eq!(
             vec![
                 BTreeSet::new(),
-                BTreeSet::from([West(1..=3, Right)]),
-                BTreeSet::from([North(1, Right), South(3, Right)]),
-                BTreeSet::from([East(1..=3, Right)]),
+                BTreeSet::from([Horizontal(West, 1..=3, Right)]),
+                BTreeSet::from([Vertical(North, 1, Right), Vertical(South, 3, Right)]),
+                BTreeSet::from([Horizontal(East, 1..=3, Right)]),
                 BTreeSet::new(),
             ],
             bitmap
@@ -708,31 +721,43 @@ mod tests {
         let row: Vec<RangeInclusive<usize>> = fill_row(&BTreeSet::from([]));
         assert_eq!(Vec::<RangeInclusive<usize>>::new(), row);
 
-        assert_eq!(vec![1..=3], fill_row(&BTreeSet::from([East(1..=3, Right)])));
-
-        assert_eq!(
-            vec![1..=3, 10..=20],
-            fill_row(&BTreeSet::from([East(1..=3, Right), East(10..=20, Right)]))
-        );
-
         assert_eq!(
             vec![1..=3],
-            fill_row(&BTreeSet::from([North(1, Right), South(3, Right)]))
+            fill_row(&BTreeSet::from([Horizontal(East, 1..=3, Right)]))
         );
 
         assert_eq!(
             vec![1..=3, 10..=20],
             fill_row(&BTreeSet::from([
-                North(1, Right),
-                South(3, Right),
-                North(10, Left),
-                South(20, Right),
+                Horizontal(East, 1..=3, Right),
+                Horizontal(East, 10..=20, Right)
+            ]))
+        );
+
+        assert_eq!(
+            vec![1..=3],
+            fill_row(&BTreeSet::from([
+                Vertical(North, 1, Right),
+                Vertical(South, 3, Right)
+            ]))
+        );
+
+        assert_eq!(
+            vec![1..=3, 10..=20],
+            fill_row(&BTreeSet::from([
+                Vertical(North, 1, Right),
+                Vertical(South, 3, Right),
+                Vertical(North, 10, Left),
+                Vertical(South, 20, Right),
             ]))
         );
 
         assert_eq!(
             vec![1..=20],
-            fill_row(&BTreeSet::from([North(1, Right), East(10..=20, Left)]))
+            fill_row(&BTreeSet::from([
+                Vertical(North, 1, Right),
+                Horizontal(East, 10..=20, Left)
+            ]))
         );
     }
 
