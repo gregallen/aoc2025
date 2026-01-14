@@ -1,9 +1,91 @@
+use crate::Direction::Northward;
+use crate::Outline::{East, North, South, West};
+use Direction::{Eastward, Southward, Westward};
 use anyhow::Error;
 use derivative::Derivative;
-use std::collections::{HashMap, HashSet};
+use simple_svg::Group;
+use simple_svg::Polyline;
+use simple_svg::Shape;
+use simple_svg::Sstyle;
+use simple_svg::Svg;
+use simple_svg::Widget;
+use simple_svg::svg_out;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, stdin};
-use std::{env, mem};
+use std::ops::RangeInclusive;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Turn {
+    Left,
+    Right,
+}
+
+#[derive(Debug)]
+enum Direction {
+    Northward,
+    Southward,
+    Eastward,
+    Westward,
+}
+
+impl Direction {
+    fn turn(&self, previously: &Direction) -> Turn {
+        match (previously, self) {
+            (Northward, Eastward) => Turn::Right,
+            (Eastward, Southward) => Turn::Right,
+            (Southward, Westward) => Turn::Right,
+            (Westward, Northward) => Turn::Right,
+
+            (Northward, Westward) => Turn::Left,
+            (Westward, Southward) => Turn::Left,
+            (Southward, Eastward) => Turn::Left,
+            (Eastward, Northward) => Turn::Left,
+
+            (_, _) => {
+                panic!("Can't turn from {previously:?} to {self:?}")
+            }
+        }
+    }
+}
+
+/// SVG style: `y` increases downwards, `x` increases rightwards. South is y increasing, East is x increasing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Outline {
+    /// increasing x
+    East(RangeInclusive<usize>, Turn),
+    /// decreasing x
+    West(RangeInclusive<usize>, Turn),
+    /// decreasing y
+    North(usize, Turn),
+    /// increasing y
+    South(usize, Turn),
+}
+
+impl Outline {
+    #[inline]
+    fn index(&self) -> usize {
+        match self {
+            East(h, _) | West(h, _) => *h.start(),
+            North(v, _) | South(v, _) => *v,
+        }
+    }
+}
+
+impl Ord for Outline {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.index().cmp(&other.index())
+    }
+}
+impl PartialOrd for Outline {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
@@ -22,209 +104,323 @@ fn main() -> Result<(), Error> {
     };
     let text = file.lines().map(Result::unwrap).collect::<Vec<_>>();
 
-    let result = junctions(text, 1_000_000)?;
+    // let area = area(text)?;
+    // println!("area: {area}");
 
-    println!("{result}");
+    let area = tiled_area(text)?;
+    println!("area: {area}");
 
     Ok(())
 }
 
-#[derive(Derivative, Clone, Debug)]
-#[derivative(Hash, PartialEq, Eq)]
+#[derive(Derivative, Clone, Debug, Hash, PartialEq, Eq)]
 struct Point {
-    x: i64,
-    y: i64,
-    z: i64,
-    #[derivative(Hash = "ignore")]
-    #[derivative(PartialEq = "ignore")]
-    id: usize,
+    x: usize,
+    y: usize,
 }
 
-fn junctions(lines: Vec<String>, connections: usize) -> anyhow::Result<usize> {
+fn area(lines: Vec<String>) -> anyhow::Result<usize> {
     let points = parse_lines(lines);
-    let mut circuits = (0..points.len())
-        .map(|i| HashSet::from([i]))
-        .collect::<Vec<_>>();
-    let mut point_to_circuit = (0..points.len()).collect::<Vec<usize>>();
-    let mut junctions: HashSet<(usize, usize)> = HashSet::new();
+    let num_points = points.len();
+    let pairs = points.iter().enumerate().map(|(i, p)| {
+        points[i + 1..num_points]
+            .iter()
+            .map(|q| weight(p, q))
+            .max()
+            .unwrap_or(0)
+    });
 
-    for _ in 0..connections {
-        let (left_point_id, right_point_id) = closest_neighbours(&points, &circuits, &junctions);
+    let largest_area = pairs.max().unwrap_or(0);
+    Ok(largest_area)
+}
 
-        junctions.insert((left_point_id, right_point_id));
-        junctions.insert((right_point_id, left_point_id));
+fn tiled_area(lines: Vec<String>) -> anyhow::Result<usize> {
+    let points = parse_lines(lines);
 
-        let left_circuit_id = point_to_circuit[left_point_id];
-        let right_circuit_id = point_to_circuit[right_point_id];
-        if left_circuit_id != right_circuit_id {
-            let mut obsolete_circuit_point_ids = mem::take(&mut circuits[right_circuit_id]);
-            for point_id in obsolete_circuit_point_ids.iter() {
-                point_to_circuit[*point_id] = left_circuit_id;
-            }
-            circuits[left_circuit_id].extend(obsolete_circuit_point_ids.drain());
+    let max_x = points.iter().map(|p| p.x).max().unwrap_or(0);
+    let max_y = points.iter().map(|p| p.y).max().unwrap_or(0);
+    to_svg("day9.svg", &points, max_x, max_y);
+    let num_points = points.len();
 
-            // are all the points now in one circuit?
-            if circuits[left_circuit_id].len() == points.len() {
-                let result = points[left_point_id].x as usize * points[right_point_id].x as usize;
-                println!("*** {result} !!!");
-                return Ok(result);
-            }
-        };
+    let mut bitmap = vec![BTreeSet::new(); max_y + 1];
+    draw(&points, &mut bitmap);
+
+    let filled_rows = bitmap.iter().map(|r| fill_row(r)).collect::<Vec<_>>();
+
+    // show lines 1774..=1776
+    for i in 1774..=1776 {
+        println!("row {i} {:?}", bitmap[i]);
     }
-    // find 3 largest circuits
-    let mut circuit_sizes = circuits.iter().map(HashSet::len).collect::<Vec<_>>();
-    circuit_sizes.sort();
-    println!("{circuit_sizes:?}");
-    Ok(circuit_sizes.into_iter().rev().take(3).product())
+
+    // to_png("day9.png", &bitmap, max_x as u32 + 1, max_y as u32 + 1);
+
+    let mut all_pairs = (0..num_points)
+        .flat_map(move |i| ((i + 1)..num_points).map(move |j| (i, j)))
+        .collect::<Vec<_>>();
+    all_pairs.sort_by_cached_key(|&(i, j)| weight(&points[i], &points[j]));
+    eprintln!("Sorted {} pairs by weight", all_pairs.len());
+
+    let largest_corners = all_pairs
+        .iter()
+        .rev()
+        .find(|&(i, j)| is_covered(&points[*i], &points[*j], &filled_rows))
+        .expect("No covered rectangles found!");
+
+    let largest_area = weight(&points[largest_corners.0], &points[largest_corners.1]);
+    Ok(largest_area)
+}
+
+fn is_covered(p: &Point, q: &Point, bitmap: &Vec<Vec<RangeInclusive<usize>>>) -> bool {
+    // let min_x = p.x.min(q.x);
+    let min_y = p.y.min(q.y);
+
+    // let max_x = p.x.max(q.x);
+    let max_y = p.y.max(q.y);
+
+    // For each horizontal strip of (p,q), walk from left edge and check that an odd number of vertical Outlines are crossed,
+    // or the point lies on a vertical or wholly inside a horizontal.
+    // If we find any strip of the rectangle starts after an even number of boundaries
+    // we can immediately return false
+    // let left_edge = North(min_x);
+    // let right_edge = North(max_x);
+    // let past_right_edge = North(max_x + 1);
+    let counter_example = bitmap[min_y..=max_y].iter().find(|row| {
+        // let to_the_left = row.range(..=&left_edge);
+        // let verticals_to_left: usize = to_the_left.clone().map(Outline::verticals).sum();
+        // if let Some(outline_at_left_edge) = to_the_left.last() {
+        //     match outline_at_left_edge {
+        //         Horizontal(rang) => {
+        //             if !rang.contains(&min_x) {
+        //                 return true;
+        //             }
+        //         }
+        //         Vertical(v) => {
+        //             if verticals_to_left % 2 == 0 {
+        //                 // immediately to right must be untiled, will be a counter example unless
+        //                 // we're width 1 and right on the edge. i.e. min_x == max_x == vertical?
+        //                 return *v != min_x || min_x != max_x;
+        //             }
+        //         }
+        //     }
+        //     if min_x == max_x {
+        //         return false;
+        //     }
+        //     // walking to right-edge must not cross any verticals (but can cross horizontal)
+        //     // excepting case where we finish exactly one & there are even verticals to the right
+        //     let vertical_crossed = row
+        //         .range(&left_edge..&right_edge)
+        //         .find(|o| matches!(o, Vertical(v) if *v > min_x))
+        //         .is_some();
+        //     if vertical_crossed {
+        //         return true;
+        //     }
+        //
+        //     // finally, max_x must be inside preceding outline or have odd number of verticals to right
+        //     // or be exactly on vertical with even verticals to right
+        //     let even_verticals_to_past_right = row
+        //         .range(&past_right_edge..)
+        //         .map(Outline::verticals)
+        //         .sum::<usize>()
+        //         % 2
+        //         == 0;
+        //     if !even_verticals_to_past_right {
+        //         // if right edge actually falls right on the start of next region that's a counter example
+        //         return row.contains(&right_edge);
+        //     }
+        //     let outline_to_left_of_right_edge = row
+        //         .range(..=&right_edge)
+        //         .last()
+        //         .expect("No outline before right edge, but there was one for left edge!");
+        //     match outline_to_left_of_right_edge {
+        //         Horizontal(rang) => !rang.contains(&max_x) && even_verticals_to_past_right,
+        //         Vertical(v) => *v != max_x || !even_verticals_to_past_right,
+        //     }
+        // } else {
+        // left edge is untiled
+        return true;
+        // }
+    });
+    counter_example.is_none()
+}
+
+/// south is y increasing
+/// east is x increasing
+fn direction(from: &Point, to: &Point) -> Direction {
+    if from.x == to.x {
+        // north or south
+        if from.y < to.y { Southward } else { Northward }
+    } else {
+        if from.x < to.x { Eastward } else { Westward }
+    }
+}
+
+fn draw(points: &[Point], bitmap: &mut Vec<BTreeSet<Outline>>) {
+    let num_points = points.len();
+    let mut previous_direction = direction(&points[num_points - 2], &points[num_points - 1]);
+
+    for (i, point) in points.iter().enumerate() {
+        let Point { x, y } = point;
+        let prev = &points[(i + num_points - 1) % num_points];
+
+        let direction = direction(prev, &point);
+        let turn = direction.turn(&previous_direction);
+
+        let outline = match direction {
+            Northward => North(*x, turn),
+            Southward => South(*x, turn),
+            Eastward => East(prev.x..=*x, turn),
+            Westward => West(*x..=prev.x, turn),
+        };
+
+        match direction {
+            Northward | Southward => {
+                let from_y = prev.y.min(*y) + 1;
+                let to_y = prev.y.max(*y);
+                for bits in &mut bitmap[from_y..to_y] {
+                    bits.insert(outline.clone());
+                }
+            }
+            Eastward | Westward => {
+                bitmap[*y].insert(outline);
+            }
+        }
+
+        previous_direction = direction;
+    }
+}
+
+/// take an outline and replaces the edge with simple contiguous horizontal ranges
+/// Fill is assumed to be on the right of the line - i.e. line direction is clockwise around enclosed space
+/// i.e. fill is always to the +x of North and -x of South
+fn fill_row(row: &BTreeSet<Outline>) -> Vec<RangeInclusive<usize>> {
+    let mut new_row = vec![];
+
+    let mut outline_iter = row.iter().peekable();
+    while let Some(o) = outline_iter.next() {
+        match o {
+            North(left, _) => {
+                let mut rightmost = None;
+                // this is typical at left edge
+                // fill through any WR, terminating at a WL or N?, or just this outline if next is none or S?
+                while let Some(next) = outline_iter.peek() {
+                    match next {
+                        West(rang, Turn::Right) => {
+                            outline_iter.next();
+                            rightmost = Some(rang.end());
+                        }
+                        West(rang, Turn::Left) => {
+                            // in this case we stop filling
+                            outline_iter.next();
+                            rightmost = Some(rang.end());
+                            break;
+                        }
+                        North(right, _) => {
+                            rightmost = Some(right);
+                        }
+                        _ => {
+                            panic!("Impossible outline after South: {:?}", next);
+                        }
+                    }
+                }
+                new_row.push(*left..=*rightmost.expect("No right edge!"));
+            }
+            West(rang, Turn::Left) => {
+                // typically around 12 o'clock position
+                // ??? Sounds wrong. surely always going East/right here?
+                panic!("Unexpected {o:?} at start of row {row:?}")
+                // new_row.push(rang.clone());
+            }
+            East(rang, Turn::Right) | West(rang, Turn::Right) => {
+                // likely a "peak" around 6 o'clock position, or low hanging peak around 12 o'clock position
+                // but if we see a South after east, or North after West it was actually a trough
+                // TODO implement this!
+                let mut rightmost = rang.end();
+                while let Some(next) = outline_iter.peek() {
+                    match next {
+                        West(rang, Turn::Right) => {
+                            outline_iter.next();
+                            rightmost = rang.end();
+                        }
+                        West(rang, Turn::Left) => {
+                            // in this case we stop filling
+                            outline_iter.next();
+                            rightmost = rang.end();
+                            break;
+                        }
+                        North(right, _) => {
+                            rightmost = right;
+                        }
+                        _ => {
+                            panic!("Impossible outline after South: {:?}", next);
+                        }
+                    }
+                }
+                new_row.push(*rang.start()..=*rightmost);
+            }
+            East(rang, Turn::Left) => {
+                // typically around 6 o'clock position
+                new_row.push(rang.clone());
+            }
+            South(_, _) => {
+                panic!("Unexpected {o:?} at start of row {row:?}")
+            }
+        }
+    }
+    new_row
+}
+
+fn to_svg(file: &str, points: &Vec<Point>, width: usize, height: usize) {
+    let mut svg = Svg::new(width as f64, height as f64);
+
+    let mut polyline_sstyle = Sstyle::new();
+    polyline_sstyle.fill = Some("black".to_string());
+    polyline_sstyle.stroke = Some("white".to_string());
+    polyline_sstyle.stroke_width = Some(25.0);
+
+    let polyline_id = svg.add_shape(Shape::Polyline(Polyline::new(
+        points.iter().map(|p| (p.x as f64, p.y as f64)).collect(),
+    )));
+
+    eprintln!("Drawing image...");
+
+    let mut group = Group::new();
+    group.place_widget(Widget {
+        shape_id: polyline_id,
+        style: Some(polyline_sstyle),
+        at: Some((0.0, 0.0)),
+        ..Default::default()
+    });
+
+    svg.add_default_group(group);
+
+    let svg_str = svg_out(svg);
+    eprintln!("Done drawing image.");
+
+    // write svg_str to file
+    std::fs::write(file, svg_str).expect("Unable to write to file");
 }
 
 fn parse_lines(lines: Vec<String>) -> Vec<Point> {
     lines
         .iter()
-        .enumerate()
-        .map(|(id, l)| {
-            let mut parts = l.split(',').map(|d| d.parse::<i64>().unwrap());
+        .map(|l| {
+            let mut parts = l.split(',').map(|d| d.parse::<usize>().unwrap());
             Point {
                 x: parts.next().unwrap(),
                 y: parts.next().unwrap(),
-                z: parts.next().unwrap(),
-                id,
             }
         })
         .collect()
 }
 
-fn closest_neighbours(
-    points: &[Point],
-    circuits: &[HashSet<usize>],
-    junctions: &HashSet<(usize, usize)>,
-) -> (usize, usize) {
-    let midpoints: Vec<_> = circuits
-        .iter()
-        .filter(|circuit| !circuit.is_empty())
-        .map(|point_ids| midpoint(points, point_ids))
-        .collect();
-    let num_midpoints = midpoints.len();
-
-    let midpoint_min_distance2_estimate = midpoints
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p, &midpoints[(i + 1) % num_midpoints]))
-        .min_by_key(tuple_weight)
-        .as_ref()
-        .map(tuple_weight)
-        .unwrap_or(1);
-    let midpoint_min_distance_estimate =
-        (midpoint_min_distance2_estimate as f64).sqrt().round() as i64;
-    println!("midpoint distance estimate: {midpoint_min_distance_estimate}");
-
-    let mut blocks: HashMap<(i64, i64, i64), Vec<&Point>> = HashMap::new();
-
-    for point in points {
-        let xb = point.x / midpoint_min_distance_estimate;
-        let yb = point.y / midpoint_min_distance_estimate;
-        let zb = point.z / midpoint_min_distance_estimate;
-        blocks.entry((xb, yb, zb)).or_default().push(point);
-    }
-
-    // for all blocks with at least 2 points, compute min pair
-    let closest_in_block = blocks
-        .iter()
-        .filter(|(_, points)| points.len() >= 2)
-        .filter_map(|(_, points)| {
-            points
-                .iter()
-                .enumerate()
-                .flat_map(|(i, p)| {
-                    points
-                        .iter()
-                        .skip(i + 1)
-                        .filter(|q| !junctions.contains(&(p.id, q.id)))
-                        // .filter(|q| point_to_circuit[p.id] != point_to_circuit[q.id])
-                        .map(move |q| (*p, *q))
-                })
-                .min_by_key(tuple_weight)
-        });
-
-    let neighbours: Vec<_> = (0..=1)
-        .flat_map(|dx| {
-            (-1..=1).flat_map(move |dy| {
-                (-1..=1)
-                    .filter(move |dz| dx != 0 || dy != 0 || *dz != 0)
-                    .map(move |dz| (dx, dy, dz))
-            })
-        })
-        .collect();
-
-    let result = blocks
-        .iter()
-        .flat_map(|((bx, by, bz), points)| {
-            neighbours
-                .iter()
-                .map(move |offset| (bx + offset.0, by + offset.1, bz + offset.2))
-                .filter_map(|c| blocks.get(&c))
-                .flat_map(|others| {
-                    points.iter().flat_map(|p| {
-                        others
-                            .iter()
-                            .filter(|q| !junctions.contains(&(p.id, q.id)))
-                            .map(move |q| (*p, *q))
-                    })
-                })
-                .min_by_key(tuple_weight)
-        })
-        .chain(closest_in_block)
-        .min_by_key(tuple_weight)
-        .expect("No neighbours!");
-
-    println!(
-        "joining {result:?}, points {} & {}",
-        result.0.id, result.1.id,
-    );
-
-    (result.0.id, result.1.id)
-}
-
-fn midpoint<'a, I>(points: &[Point], point_ids: I) -> Point
-where
-    I: IntoIterator<Item = &'a usize>,
-{
-    if points.len() == 1 {
-        points[0].clone()
-    } else {
-        let mut count = 0;
-        let mut mean = Point {
-            x: 0,
-            y: 0,
-            z: 0,
-            id: 0,
-        };
-        for point_id in point_ids {
-            let point = &points[*point_id];
-            count += 1;
-            mean.x += point.x;
-            mean.y += point.y;
-            mean.z += point.z
-        }
-        mean.x /= count;
-        mean.y /= count;
-        mean.z /= count;
-        mean
-    }
-}
-
 #[inline]
-fn tuple_weight((a, b): &(&Point, &Point)) -> i64 {
-    weight(a, b)
-}
-
-#[inline]
-fn weight(a: &Point, b: &Point) -> i64 {
-    (a.x - b.x).pow(2) + (a.y - b.y).pow(2) + (a.z - b.z).pow(2)
+fn weight(a: &Point, b: &Point) -> usize {
+    (a.x.max(b.x) - a.x.min(b.x) + 1) * (a.y.max(b.y) - a.y.min(b.y) + 1)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Turn::{Left, Right};
     use crate::*;
 
     const EXAMPLE_INPUT: &str = r"7,1
@@ -239,48 +435,308 @@ mod tests {
     #[test]
     fn example() {
         let lines = EXAMPLE_INPUT.split('\n').map(String::from).collect();
-        let result = junctions(lines, 10);
-        assert_eq!(40, result.unwrap());
+        let result = area(lines);
+        assert_eq!(50, result.unwrap());
     }
 
     #[test]
     fn part2() {
         let lines = EXAMPLE_INPUT.split('\n').map(String::from).collect();
-        let result = junctions(lines, 10000);
-        assert_eq!(25272, result.unwrap());
+        let result = tiled_area(lines);
+        assert_eq!(24, result.unwrap());
     }
 
     #[test]
-    fn closest_neighbours_example() {
-        let points = example_points();
+    fn draw_clockwise_square() {
+        let lines = r"0,0
+2,0
+2,2
+0,2"
+        .split('\n')
+        .map(String::from)
+        .collect();
+        let points = parse_lines(lines);
+        let mut bitmap = vec![BTreeSet::new(); 3];
+        draw(&points, &mut bitmap);
 
-        let mut circuits = (0..points.len())
-            .map(|i| HashSet::from([i]))
-            .collect::<Vec<_>>();
-        let mut point_to_circuit = (0..points.len()).collect::<Vec<usize>>();
-        let mut junctions: HashSet<(usize, usize)> = HashSet::new();
-
-        let result = closest_neighbours(&points, &circuits, &junctions);
-        assert!(matches!(result, (0, 19) | (19, 0)));
-        circuits[0].insert(19);
-        circuits[19].clear();
-        point_to_circuit[19] = 0;
-        junctions.insert((0, 19));
-        junctions.insert((19, 0));
-
-        let result2 = closest_neighbours(&points, &circuits, &junctions);
-        assert!(matches!(result2, (0, 7) | (7, 0)));
-        circuits[0].insert(7);
-        circuits[7].clear();
-        point_to_circuit[7] = 0;
-        junctions.insert((0, 7));
-        junctions.insert((7, 0));
-
-        let results3 = closest_neighbours(&points, &circuits, &junctions);
-        assert!(matches!(results3, (2, 13) | (13, 2)));
+        assert_eq!(
+            vec![
+                BTreeSet::from([East(0..=2, Right)]),
+                BTreeSet::from([North(0, Right), South(2, Right)]),
+                BTreeSet::from([West(0..=2, Right)]),
+            ],
+            bitmap
+        );
     }
 
-    fn example_points() -> Vec<Point> {
+    #[test]
+    fn draw_anti_clockwise_square() {
+        let lines = r"0,0
+0,2
+2,2
+2,0"
+        .split('\n')
+        .map(String::from)
+        .collect();
+        let points = parse_lines(lines);
+        let mut bitmap = vec![BTreeSet::new(); 3];
+        draw(&points, &mut bitmap);
+
+        assert_eq!(
+            vec![
+                BTreeSet::from([West(0..=2, Left)]),
+                BTreeSet::from([South(0, Left), North(2, Left)]),
+                BTreeSet::from([East(0..=2, Left)]),
+            ],
+            bitmap
+        );
+    }
+
+    #[test]
+    fn test_fill_row() {
+        assert_eq!(
+            vec![1..=6],
+            fill_row(&BTreeSet::from([
+                East(1..=2, Right),
+                South(4, Right),
+                North(6, Left)
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_is_covered_single_line() {
+        assert!(!is_covered(
+            &Point { x: 0, y: 0 },
+            &Point { x: 0, y: 0 },
+            &vec![vec![]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 0, y: 0 },
+            &Point { x: 1, y: 0 },
+            &vec![vec![]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 0, y: 0 },
+            &vec![vec![]]
+        ));
+
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 0, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 0, y: 0 },
+            &Point { x: 2, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 0, y: 0 },
+            &Point { x: 3, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+
+        assert!(is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 1, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+        assert!(is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 2, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+        assert!(is_covered(
+            &Point { x: 2, y: 0 },
+            &Point { x: 2, y: 0 },
+            &vec![vec![1..=2]]
+        ));
+
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 3, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 4, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 5, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 6, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 1, y: 0 },
+            &Point { x: 7, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+
+        assert!(is_covered(
+            &Point { x: 4, y: 0 },
+            &Point { x: 4, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(is_covered(
+            &Point { x: 5, y: 0 },
+            &Point { x: 5, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(is_covered(
+            &Point { x: 6, y: 0 },
+            &Point { x: 6, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+
+        assert!(!is_covered(
+            &Point { x: 3, y: 0 },
+            &Point { x: 7, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 6, y: 0 },
+            &Point { x: 7, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+        assert!(!is_covered(
+            &Point { x: 4, y: 0 },
+            &Point { x: 7, y: 0 },
+            &vec![vec![1..=6]]
+        ));
+    }
+
+    #[test]
+    fn test_draw_example() {
+        let lines = EXAMPLE_INPUT.split('\n').map(String::from).collect();
+        let points = parse_lines(lines);
+
+        let max_y = points.iter().map(|p| p.y).max().unwrap_or(0);
+
+        let mut bitmap = vec![BTreeSet::new(); max_y + 1];
+        draw(&points, &mut bitmap);
+
+        bitmap.iter().for_each(|row| println!("{row:?}"));
+
+        let rows = bitmap.iter().map(fill_row).collect::<Vec<_>>();
+
+        // nasty edge case on row 3
+        assert!(is_covered(
+            &Point { x: 7, y: 3 },
+            &Point { x: 7, y: 3 },
+            &rows
+        ));
+        // still have an odd number of verticals to the right, so all good
+        assert!(is_covered(
+            &Point { x: 7, y: 3 },
+            &Point { x: 8, y: 3 },
+            &rows
+        ));
+        assert!(is_covered(
+            &Point { x: 7, y: 3 },
+            &Point { x: 11, y: 3 },
+            &rows
+        ));
+        assert!(is_covered(
+            &Point { x: 2, y: 3 },
+            &Point { x: 9, y: 3 },
+            &rows
+        ));
+        assert!(is_covered(
+            &Point { x: 2, y: 5 },
+            &Point { x: 9, y: 5 },
+            &rows
+        ));
+        assert!(is_covered(
+            &Point { x: 2, y: 4 },
+            &Point { x: 9, y: 4 },
+            &rows
+        ));
+        assert!(is_covered(
+            &Point { x: 2, y: 3 },
+            &Point { x: 9, y: 5 },
+            &rows
+        ));
+
+        // its fine to span multiple horizontal lines, skimming a horizontal edge, but can't cross a vertical
+        // THIS CASE NOT ALLOWED, SINCE CORNERS MUST LIE ON HORIZONTALS OR VERTICALS
+        // assert!(!is_covered(
+        //     &Point { x: 7, y: 3 },
+        //     &Point { x: 12, y: 3 },
+        //     &bitmap
+        // ));
+    }
+
+    #[test]
+    fn test_fill() {
+        let mut bitmap = vec![BTreeSet::new(); 5];
+        let points = vec![
+            Point { x: 1, y: 1 },
+            Point { x: 1, y: 3 },
+            Point { x: 3, y: 3 },
+            Point { x: 3, y: 1 },
+        ];
+        draw(&points, &mut bitmap);
+
+        assert_eq!(
+            vec![
+                BTreeSet::new(),
+                BTreeSet::from([West(1..=3, Right)]),
+                BTreeSet::from([North(1, Right), South(3, Right)]),
+                BTreeSet::from([East(1..=3, Right)]),
+                BTreeSet::new(),
+            ],
+            bitmap
+        );
+
+        to_svg("day9_test.svg", &points, 5, 5);
+
+        for bits in &bitmap {
+            println!("{bits:?}");
+        }
+    }
+
+    #[test]
+    fn test_fill_row2() {
+        let row: Vec<RangeInclusive<usize>> = fill_row(&BTreeSet::from([]));
+        assert_eq!(Vec::<RangeInclusive<usize>>::new(), row);
+
+        assert_eq!(vec![1..=3], fill_row(&BTreeSet::from([East(1..=3, Right)])));
+
+        assert_eq!(
+            vec![1..=3, 10..=20],
+            fill_row(&BTreeSet::from([East(1..=3, Right), East(10..=20, Right)]))
+        );
+
+        assert_eq!(
+            vec![1..=3],
+            fill_row(&BTreeSet::from([North(1, Right), South(3, Right)]))
+        );
+
+        assert_eq!(
+            vec![1..=3, 10..=20],
+            fill_row(&BTreeSet::from([
+                North(1, Right),
+                South(3, Right),
+                North(10, Left),
+                South(20, Right),
+            ]))
+        );
+
+        assert_eq!(
+            vec![1..=20],
+            fill_row(&BTreeSet::from([North(1, Right), East(10..=20, Left)]))
+        );
+    }
+
+    fn _example_points() -> Vec<Point> {
         let lines = EXAMPLE_INPUT.split('\n').map(String::from).collect();
         parse_lines(lines)
     }
